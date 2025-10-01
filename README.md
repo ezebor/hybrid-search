@@ -33,3 +33,100 @@ The application is split into two main asynchronous flows: data ingestion/updati
 4. Cache Miss: If the result is not in Redis, the controller queries the ChromaDB collection. ChromaDB finds the products whose vector embeddings are most similar to the vector of the search query.
 5. The results from ChromaDB are then stored in the Redis cache with an expiration time.
 6. The results are returned to the user.
+
+# Project Structure
+
+/your-project/
+├── docker-compose.yml     # Defines the backend services (Kafka, Redis)
+├── requirements.txt       # Python dependencies
+├── main.py                # Entry point to run the Flask API server
+├── controllers.py         # Contains the Flask routes and API logic
+├── consumers.py           # Contains the Kafka consumers for data processing
+├── /templates/
+│   └── index.html         # Simple HTML/CSS/JS frontend
+├── (chroma_db/)           # Directory for persistent ChromaDB data (auto-created)
+└── (products.csv)         # Product database file (auto-created)
+
+# Setup and Installation
+
+## Prerequisites
+* Python 3.8+
+* Docker and Docker Compose
+
+## Step-by-Step Guide
+1. Start Backend Services: Open a terminal in the project root and run Docker Compose. This will download the required images and start Kafka, Zookeeper, and Redis in the background.
+
+```
+docker-compose up -d
+```
+
+2. Set Up Python Environment: It is highly recommended to use a virtual environment.
+
+```
+# Create a virtual environment
+python -m venv venv
+
+# Activate it
+# On Windows: venv\Scripts\activate
+# On macOS/Linux: source venv/bin/activate
+```
+
+3. Install Dependencies: Install all the required Python packages from the requirements.txt file.
+
+```
+pip install -r requirements.txt
+```
+
+## Running the Application
+You must run the API server and the Kafka consumers in two separate terminals.
+
+### Terminal 1: Start the Kafka Consumers
+This process listens for messages and updates the databases.
+
+```
+python consumers.py
+```
+
+### Terminal 2: Start the Flask API Server
+This process runs the web server and the search frontend.
+
+```
+python main.py
+```
+
+The API will now be running at http://localhost:5000.
+
+## How to Use
+### API Endpoints
+You can use a tool like curl or Postman to interact with the API.
+
+1. Create Products (POST /products)
+
+```
+curl -X POST http://localhost:5000/products \
+-H "Content-Type: application/json" \
+-d '[
+  {"name": "Organic Green Tea", "description": "A refreshing and healthy blend of premium green tea leaves."},
+  {"name": "Artisan Dark Roast Coffee", "description": "Rich and bold dark roast coffee beans, ethically sourced from South America."}
+]'
+```
+
+2. Update Products (PUT /products)
+
+```
+curl -X PUT http://localhost:5000/products \
+-H "Content-Type: application/json" \
+-d '[
+  {"id": "prod_0001", "description": "A refreshing and healthy blend of premium organic green tea leaves from the misty mountains."}
+]'
+```
+
+3. Search for Products (GET /products/search)
+
+```
+curl "http://localhost:5000/products/search?q=a%20healthy%20morning%20drink"
+```
+
+### Web Frontend
+Navigate to http://localhost:5000 in your web browser to use the simple and modern search interface.
+
