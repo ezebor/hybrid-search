@@ -51,13 +51,13 @@ The application is split into two main asynchronous flows: data ingestion/updati
 # Setup and Installation
 
 ## Step-by-Step Guide
-1. Build and Start All Services
+### 1. Build and Start All Services
 
 ```
 docker-compose up --build -d
 ```
 
-2. Monitor the Application Logs
+### 2. Monitor the Application Logs
 
 * Terminal 1 (to watch the consumer)
 ```
@@ -68,7 +68,7 @@ docker-compose logs -f kafka_consumer
 docker-compose logs -f api_server
 ```
 
-3. Test the Application
+### 3. Test the Application
 
 The API will now be running at http://localhost:5000.
 
