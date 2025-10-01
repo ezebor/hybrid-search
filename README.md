@@ -66,7 +66,7 @@ docker-compose up -d
 
 ```
 # Create a virtual environment
-python -m venv venv
+python3.12 -m venv venv
 
 # Activate it
 # On Windows: venv\Scripts\activate
