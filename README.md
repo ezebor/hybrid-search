@@ -36,6 +36,7 @@ The application is split into two main asynchronous flows: data ingestion/updati
 
 # Project Structure
 
+```
 /your-project/
 ├── docker-compose.yml     # Defines the backend services (Kafka, Redis)
 ├── requirements.txt       # Python dependencies
@@ -46,6 +47,7 @@ The application is split into two main asynchronous flows: data ingestion/updati
 │   └── index.html         # Simple HTML/CSS/JS frontend
 ├── (chroma_db/)           # Directory for persistent ChromaDB data (auto-created)
 └── (products.csv)         # Product database file (auto-created)
+```
 
 # Setup and Installation
 
