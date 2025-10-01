@@ -1,178 +1,138 @@
-import json
-import logging
-import os
 import pandas as pd
 from kafka import KafkaConsumer
+import json
+import os
 import chromadb
 from sentence_transformers import SentenceTransformer
-import redis
-import threading
+import logging
+import time
 
-# --- BASIC CONFIGURATION ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# --- Setup Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - CONSUMER - %(levelname)s - %(message)s')
 
-# --- FILE PATHS & SHARED RESOURCES ---
-CSV_FILE_PATH = 'products.csv'
-FILE_LOCK = threading.Lock()  # To prevent race conditions when writing to the CSV
-
-# --- SERVICE CLIENTS (re-initialized for the consumer process) ---
-try:
-    redis_client = redis.Redis(host='localhost', port=6379)
-    redis_client.ping()
-    logger.info("Consumer connected to Redis.")
-except Exception as e:
-    logger.error(f"Consumer could not connect to Redis: {e}")
-    redis_client = None
-
-try:
-    chroma_client = chromadb.PersistentClient(path="./chroma_db")
-    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-    product_collection = chroma_client.get_or_create_collection(name="products_v2")
-    logger.info("Consumer connected to ChromaDB.")
-except Exception as e:
-    logger.error(f"Consumer could not connect to ChromaDB: {e}")
-    product_collection = None
+# --- Configuration ---
+CSV_FILE = 'products.csv'
 
 
-def get_dataframe():
-    """Safely reads the CSV file into a pandas DataFrame."""
-    with FILE_LOCK:
-        if not os.path.exists(CSV_FILE_PATH):
-            return pd.DataFrame(columns=['id', 'name', 'description'])
-        return pd.read_csv(CSV_FILE_PATH)
+# --- Service Connections ---
+def connect_to_service(service_name, connection_func, retries=5, delay=5):
+    """Generic connection function with retries."""
+    for i in range(retries):
+        try:
+            client = connection_func()
+            logging.info(f"Successfully connected to {service_name}.")
+            return client
+        except Exception as e:
+            logging.warning(
+                f"{service_name} connection attempt {i + 1}/{retries} failed: {e}. Retrying in {delay} seconds...")
+            time.sleep(delay)
+    logging.error(f"Could not connect to {service_name} after several retries. Exiting.")
+    exit(1)
 
 
-def save_dataframe(df):
-    """Safely saves the DataFrame to the CSV file."""
-    with FILE_LOCK:
-        df.to_csv(CSV_FILE_PATH, index=False)
+# Inside Docker, we use the service names from docker-compose.yml, not 'localhost'
+chroma_client = connect_to_service("ChromaDB", lambda: chromadb.HttpClient(host='chroma', port=8000))
+collection = chroma_client.get_or_create_collection(name="products")
+
+model = SentenceTransformer('all-MiniLM-L6-v2')
+logging.info("Sentence Transformer model loaded.")
 
 
-def invalidate_cache():
-    """Invalidates the entire Redis search cache."""
-    if redis_client:
-        redis_client.flushall()
-        logger.info("Redis cache invalidated due to product updates.")
+class ProductProcessor:
+    def __init__(self, csv_file):
+        self.csv_file = csv_file
+        self.df = self._load_or_create_df()
 
+    def _load_or_create_df(self):
+        if os.path.exists(self.csv_file):
+            logging.info(f"Loading existing products from {self.csv_file}")
+            return pd.read_csv(self.csv_file)
+        else:
+            logging.info(f"Creating new products file: {self.csv_file}")
+            df = pd.DataFrame(columns=['id', 'name', 'description'])
+            df.to_csv(self.csv_file, index=False)
+            return df
 
-class ProductCreationConsumer:
-    """Handles the creation of new products."""
+    def _generate_id(self):
+        if self.df.empty:
+            return "prod_0001"
+        last_id = self.df['id'].max()
+        last_num = int(last_id.split('_')[1])
+        new_num = last_num + 1
+        return f"prod_{new_num:04d}"
 
-    def process(self, products_data):
-        logger.info(f"Processing {len(products_data)} new products for creation.")
-        df = get_dataframe()
+    def add_products(self, products):
+        new_records = []
+        for product in products:
+            new_id = self._generate_id()
+            record = {'id': new_id, 'name': product['name'], 'description': product['description']}
+            new_records.append(record)
+            new_df_record = pd.DataFrame([record])
+            self.df = pd.concat([self.df, new_df_record], ignore_index=True)
 
-        new_products = []
-        for product in products_data:
-            # Generate a unique ID
-            new_id = f"prod_{len(df) + len(new_products) + 1:04d}"
-            new_products.append({
-                'id': new_id,
-                'name': product.get('name'),
-                'description': product.get('description')
-            })
+        self.df.to_csv(self.csv_file, index=False)
+        logging.info(f"Added {len(new_records)} products to CSV.")
+        self._update_chroma(new_records)
 
-        if not new_products:
+    def update_products(self, products_to_update):
+        updated_records = []
+        for product_update in products_to_update:
+            product_id = product_update['id']
+            idx = self.df.index[self.df['id'] == product_id][0]
+            if 'name' in product_update:
+                self.df.at[idx, 'name'] = product_update['name']
+            if 'description' in product_update:
+                self.df.at[idx, 'description'] = product_update['description']
+            updated_records.append(self.df.loc[idx].to_dict())
+
+        self.df.to_csv(self.csv_file, index=False)
+        logging.info(f"Updated {len(updated_records)} products in CSV.")
+        self._update_chroma(updated_records)
+
+    def _update_chroma(self, records):
+        if not records:
             return
 
-        new_products_df = pd.DataFrame(new_products)
-        df = pd.concat([df, new_products_df], ignore_index=True)
-        save_dataframe(df)
+        documents_to_embed = [f"{p['name']}: {p['description']}" for p in records]
+        embeddings = model.encode(documents_to_embed).tolist()
+        product_ids = [p['id'] for p in records]
+        product_metadata = [{"name": p['name']} for p in records]
 
-        # Update ChromaDB
-        if product_collection is not None:
-            product_collection.add(
-                ids=[p['id'] for p in new_products],
-                documents=[f"{p['name']}: {p['description']}" for p in new_products],
-                metadatas=[{'name': p['name']} for p in new_products]
-            )
-            logger.info(f"Added {len(new_products)} products to ChromaDB.")
-
-        invalidate_cache()
-
-
-class ProductEditionConsumer:
-    """Handles updates to existing products."""
-
-    def process(self, products_data):
-        logger.info(f"Processing {len(products_data)} products for update.")
-        df = get_dataframe()
-        df.set_index('id', inplace=True)
-
-        updated_products = []
-        for product in products_data:
-            prod_id = product.get('id')
-            if prod_id in df.index:
-                if 'name' in product:
-                    df.loc[prod_id, 'name'] = product['name']
-                if 'description' in product:
-                    df.loc[prod_id, 'description'] = product['description']
-
-                updated_products.append(df.loc[prod_id].to_dict())
-
-        if not updated_products:
-            return
-
-        df.reset_index(inplace=True)
-        save_dataframe(df)
-
-        # Update ChromaDB (upsert is useful here)
-        if product_collection is not None:
-            # We need to re-fetch name/desc in case only one was provided
-            final_updates = []
-            df.set_index('id', inplace=True)
-            for prod_id in [p['id'] for p in products_data if p.get('id') in df.index]:
-                final_updates.append(df.loc[prod_id].to_dict())
-
-            product_collection.update(
-                ids=[p['id'] for p in final_updates],
-                documents=[f"{p['name']}: {p['description']}" for p in final_updates],
-                metadatas=[{'name': p['name']} for p in final_updates]
-            )
-            logger.info(f"Updated {len(updated_products)} products in ChromaDB.")
-
-        invalidate_cache()
-
-
-def run_consumers():
-    """
-    Initializes and runs the main Kafka consumer loop.
-    It listens to the 'product-updates' topic and dispatches
-    messages to the appropriate processor.
-    """
-    try:
-        consumer = KafkaConsumer(
-            'product-updates',
-            bootstrap_servers='localhost:9092',
-            auto_offset_reset='earliest',
-            group_id='product-processor-group',
-            value_deserializer=lambda m: json.loads(m.decode('utf-8'))
+        collection.upsert(
+            ids=product_ids,
+            embeddings=embeddings,
+            metadatas=product_metadata,
+            documents=documents_to_embed
         )
-        logger.info("Kafka Consumer connected. Waiting for messages...")
-    except Exception as e:
-        logger.error(f"Could not connect Kafka Consumer: {e}")
-        return
+        logging.info(f"Upserted {len(records)} records into ChromaDB.")
 
-    creation_handler = ProductCreationConsumer()
-    edition_handler = ProductEditionConsumer()
 
+def run_consumer():
+    consumer = connect_to_service("Kafka", lambda: KafkaConsumer(
+        'product-updates',
+        bootstrap_servers='broker:9092',
+        auto_offset_reset='earliest',
+        group_id='product-processor-group',
+        value_deserializer=lambda m: json.loads(m.decode('utf-8'))
+    ))
+    processor = ProductProcessor(CSV_FILE)
+
+    logging.info("Consumer is waiting for messages...")
     for message in consumer:
         try:
             data = message.value
             action = data.get('action')
-            payload = data.get('data')
+            payload = data.get('payload')
+            logging.info(f"Received action: {action}")
 
             if action == 'product-creation':
-                creation_handler.process(payload)
+                processor.add_products(payload)
             elif action == 'product-edition':
-                edition_handler.process(payload)
-            else:
-                logger.warning(f"Unknown action received: {action}")
-
+                processor.update_products(payload)
         except Exception as e:
-            logger.error(f"Failed to process message: {message.value}. Error: {e}")
+            logging.error(f"Failed to process message: {message.value}. Error: {e}")
 
 
 if __name__ == '__main__':
-    run_consumers()
+    run_consumer()
+

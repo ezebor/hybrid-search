@@ -38,63 +38,37 @@ The application is split into two main asynchronous flows: data ingestion/updati
 
 ```
 /your-project/
-├── docker-compose.yml     # Defines the backend services (Kafka, Redis)
-├── requirements.txt       # Python dependencies
-├── main.py                # Entry point to run the Flask API server
-├── controllers.py         # Contains the Flask routes and API logic
-├── consumers.py           # Contains the Kafka consumers for data processing
-├── /templates/
-│   └── index.html         # Simple HTML/CSS/JS frontend
-├── (chroma_db/)           # Directory for persistent ChromaDB data (auto-created)
-└── (products.csv)         # Product database file (auto-created)
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+├── main.py
+├── consumers.py
+├── controllers.py
+└── /templates/
+    └── index.html
 ```
 
 # Setup and Installation
 
-## Prerequisites
-* Python 3.8+
-* Docker and Docker Compose
-
 ## Step-by-Step Guide
-1. Start Backend Services: Open a terminal in the project root and run Docker Compose. This will download the required images and start Kafka, Zookeeper, and Redis in the background.
+1. Build and Start All Services
 
 ```
-docker-compose up -d
+docker-compose up --build -d
 ```
 
-2. Set Up Python Environment: It is highly recommended to use a virtual environment.
+2. Monitor the Application Logs
 
+* Terminal 1 (to watch the consumer)
 ```
-# Create a virtual environment
-python3.12 -m venv venv
-
-# Activate it
-# On Windows: venv\Scripts\activate
-# On macOS/Linux: source venv/bin/activate
+docker-compose logs -f kafka_consumer
 ```
-
-3. Install Dependencies: Install all the required Python packages from the requirements.txt file.
-
+* Terminal 2 (to watch the API server):
 ```
-pip install -r requirements.txt
+docker-compose logs -f api_server
 ```
 
-## Running the Application
-You must run the API server and the Kafka consumers in two separate terminals.
-
-### Terminal 1: Start the Kafka Consumers
-This process listens for messages and updates the databases.
-
-```
-python consumers.py
-```
-
-### Terminal 2: Start the Flask API Server
-This process runs the web server and the search frontend.
-
-```
-python main.py
-```
+3. Test the Application
 
 The API will now be running at http://localhost:5000.
 
@@ -132,3 +106,7 @@ curl "http://localhost:5000/products/search?q=a%20healthy%20morning%20drink"
 ### Web Frontend
 Navigate to http://localhost:5000 in your web browser to use the simple and modern search interface.
 
+## Stop the application
+```
+docker-compose down
+```
