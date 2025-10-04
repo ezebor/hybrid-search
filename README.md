@@ -41,7 +41,7 @@ The application is split into two main asynchronous flows: data ingestion/updati
 ├── docker-compose.yml
 ├── Dockerfile
 ├── requirements.txt
-├── main.py
+├── app.py
 ├── consumers.py
 ├── controllers.py
 └── /templates/
@@ -109,4 +109,11 @@ Navigate to http://localhost:5000 in your web browser to use the simple and mode
 ## Stop the application
 ```
 docker-compose down
+```
+
+## Erase containers and start over
+
+```
+docker-compose down --rmi all
+docker builder prune
 ```

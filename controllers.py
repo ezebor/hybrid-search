@@ -1,107 +1,108 @@
-import chromadb
-from flask import Flask, request, jsonify, render_template
-from kafka import KafkaProducer
 import json
+import pickle
+import pandas as pd
+import os
 import redis
-import logging
-import time
+from flask import Blueprint, request, jsonify, render_template, current_app
+from kafka import KafkaProducer
+from recommender import ProductRecommender
 
-# --- Setup Logging ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# --- CONFIGURATION ---
+KAFKA_TOPIC = 'product-events'
+KAFKA_BROKER = 'broker:29092'
+REDIS_HOST = 'redis'
+REDIS_PORT = 6379
+REDIS_MODEL_KEY = 'recommender_model'
+DATA_DIR = "/app/data"
+CSV_PATH = os.path.join(DATA_DIR, "products.csv")
+
+# --- CONNECTIONS ---
+redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
+kafka_producer = KafkaProducer(
+    bootstrap_servers=KAFKA_BROKER,
+    value_serializer=lambda v: json.dumps(v).encode('utf-8')
+)
+
+api_bp = Blueprint('api', __name__)
+recommender_cache = {'model': None}
 
 
-# --- Service Connections ---
-def connect_to_service(service_name, connection_func, retries=5, delay=5):
-    """Generic connection function with retries."""
-    for i in range(retries):
+def get_recommender():
+    """Loads the recommender model from Redis if not in memory."""
+    if recommender_cache['model'] is None:
         try:
-            client = connection_func()
-            logging.info(f"Successfully connected to {service_name}.")
-            return client
+            serialized_model = redis_client.get(REDIS_MODEL_KEY)
+            if serialized_model:
+                recommender_cache['model'] = pickle.loads(serialized_model)
+                current_app.logger.info("Loaded recommender model from Redis into memory.")
+            else:
+                current_app.logger.warning("Recommender model not found in Redis.")
+                return None
         except Exception as e:
-            logging.warning(
-                f"{service_name} connection attempt {i + 1}/{retries} failed: {e}. Retrying in {delay} seconds...")
-            time.sleep(delay)
-    logging.error(f"Could not connect to {service_name} after several retries. Exiting.")
-    exit(1)
+            current_app.logger.error(f"Failed to load model from Redis: {e}")
+            return None
+    return recommender_cache['model']
 
 
-# Inside Docker, we use the service names from docker-compose.yml, not 'localhost'
-chroma_client = connect_to_service("ChromaDB", lambda: chromadb.HttpClient(host='chroma', port=8000))
-collection = chroma_client.get_or_create_collection(name="products")
-
-redis_client = connect_to_service("Redis", lambda: redis.Redis(host='redis', port=6379, decode_responses=True))
-producer = connect_to_service("Kafka", lambda: KafkaProducer(bootstrap_servers='broker:9092',
-                                                             value_serializer=lambda v: json.dumps(v).encode('utf-8')))
+@api_bp.route('/')
+def index():
+    return render_template('index.html')
 
 
-class Controller:
-    def __init__(self, app):
-        self.app = app
-        self.register_routes()
+@api_bp.route('/products/search')
+def search_products():
+    query = request.args.get('q', '')
+    if not query:
+        return jsonify({"error": "Query parameter 'q' is required."}), 400
 
-    def register_routes(self):
-        @self.app.route('/')
-        def index():
-            return render_template('index.html')
+    cache_key = f"search:{query}"
+    cached_results = redis_client.get(cache_key)
+    if cached_results:
+        current_app.logger.info(f"CACHE HIT for query: '{query}'")
+        return jsonify(json.loads(cached_results))
 
-        @self.app.route('/products', methods=['POST'])
-        def create_products():
-            products = request.get_json()
-            if not isinstance(products, list):
-                return jsonify({"error": "Request body must be a list of products"}), 400
-            producer.send('product-updates', {'action': 'product-creation', 'payload': products})
-            producer.flush()
-            return jsonify({"status": "Product creation request sent"}), 202
+    current_app.logger.info(f"CACHE MISS for query: '{query}'")
+    recommender = get_recommender()
+    if not recommender:
+        return jsonify({"error": "Recommender model is not available yet."}), 503
 
-        @self.app.route('/products', methods=['PUT'])
-        def update_products():
-            products = request.get_json()
-            if not isinstance(products, list):
-                return jsonify({"error": "Request body must be a list of products"}), 400
-            producer.send('product-updates', {'action': 'product-edition', 'payload': products})
-            producer.flush()
-            logging.info("Product update detected. Invalidating all search caches.")
-            keys = redis_client.keys('search:*')
-            if keys:
-                redis_client.delete(*keys)
-            return jsonify({"status": "Product update request sent"}), 202
+    recommended_ids = recommender.recommend(name=query, description="", price=0)
 
-        @self.app.route('/products/search', methods=['GET'])
-        def search_products():
-            query = request.args.get('q', '')
-            if not query:
-                return jsonify({"error": "Query parameter 'q' is required"}), 400
+    try:
+        df = pd.read_csv(CSV_PATH)
 
-            cache_key = f"search:{query.lower().strip()}"
-            cached_results = redis_client.get(cache_key)
+        # Filter the DataFrame to only get the rows for the recommended products
+        results_df = df[df['id'].isin(recommended_ids)]
 
-            if cached_results:
-                logging.info(f"CACHE HIT for query: '{query}'")
-                return jsonify(json.loads(cached_results))
+        # --- MODIFICATION: Reorder the results to match the similarity ranking ---
+        # We convert the 'id' column to a categorical type that has a custom order
+        # based on the `recommended_ids` list, then sort by it.
+        results_df['id'] = pd.Categorical(results_df['id'], categories=recommended_ids, ordered=True)
+        results_df = results_df.sort_values('id')
 
-            logging.info(f"CACHE MISS for query: '{query}'")
-            results = collection.query(
-                query_texts=[query],
-                n_results=10
-            )
+        results = results_df.to_dict(orient='records')
 
-            formatted_results = []
-            if results and results['ids'] and results['ids'][0]:
-                for i, doc_id in enumerate(results['ids'][0]):
-                    description_full = results['documents'][0][i]
-                    description_parts = description_full.split(":", 1)
-                    description = description_parts[-1].strip() if len(description_parts) > 1 else description_full
+    except FileNotFoundError:
+        return jsonify({"error": "Product data not found."}), 500
 
-                    formatted_results.append({
-                        "id": doc_id,
-                        "name": results['metadatas'][0][i]['name'],
-                        "description": description
-                    })
+    redis_client.setex(cache_key, 3600, json.dumps(results))  # Cache for 1 hour
+    return jsonify(results)
 
-            redis_client.setex(cache_key, 3600, json.dumps(formatted_results))
-            return jsonify(formatted_results)
 
-    def run(self):
-        self.app.run(host='0.0.0.0', port=5000)
+@api_bp.route('/products', methods=['POST'])
+def create_products():
+    products = request.get_json()
+    message = {'action': 'product-creation', 'products': products}
+    kafka_producer.send(KAFKA_TOPIC, message)
+    kafka_producer.flush()
+    return jsonify({"status": "success", "message": "Event sent."}), 202
 
+
+@api_bp.route('/products', methods=['PUT'])
+def update_products():
+    products = request.get_json()
+    message = {'action': 'product-edition', 'products': products}
+    kafka_producer.send(KAFKA_TOPIC, message)
+    kafka_producer.flush()
+    recommender_cache['model'] = None
+    return jsonify({"status": "success", "message": "Event sent."}), 202

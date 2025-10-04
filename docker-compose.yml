@@ -1,4 +1,5 @@
 version: '3.8'
+
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.3.0
@@ -22,52 +23,49 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_NUM_PARTITIONS: 3
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    # --- MODIFICATION: Added healthcheck to ensure Kafka is ready ---
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
 
   redis:
     image: redis:7-alpine
     container_name: redis-cache
     ports:
       - "6379:6379"
-    restart: always
 
-  chroma:
-    image: chromadb/chroma:0.5.0
-    container_name: chroma-db
-    ports:
-      - "8000:8000"
-    volumes:
-      - chroma_data:/chroma/chroma
-    restart: always
-
-  # --- API Server Container ---
   api_server:
-    build: . # Build the image using the Dockerfile in the current directory
+    build: .
     container_name: api_server
-    command: python main.py # The command to run when the container starts
     ports:
-      - "5000:5000" # Map host port 5000 to container port 5000
+      - "5000:5000"
     volumes:
-      - .:/app # Mount local code for live-reloading during development
+      - product_data:/app/data
     depends_on:
-      - broker
-      - redis
-      - chroma
-    restart: always
+      # --- MODIFICATION: Changed depends_on to use the service_healthy condition ---
+      broker:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: ["python", "app.py"] # Using app.py as entrypoint
 
-  # --- Kafka Consumer Container ---
   kafka_consumer:
-    build: . # Re-use the same image built for the api_server
+    build: .
     container_name: kafka_consumer
-    command: python consumers.py # Run the consumer script instead of the main API
     volumes:
-      - .:/app
+      - product_data:/app/data
     depends_on:
-      - broker
-      - chroma
-    restart: always
+      # --- MODIFICATION: Changed depends_on to use the service_healthy condition ---
+      broker:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: ["python", "consumers.py"]
+    restart: on-failure
 
 volumes:
-  chroma_data:
-
+  product_data:

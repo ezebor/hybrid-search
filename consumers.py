@@ -1,138 +1,136 @@
-import pandas as pd
-from kafka import KafkaConsumer
-import json
 import os
-import chromadb
-from sentence_transformers import SentenceTransformer
-import logging
+import json
 import time
+import pandas as pd
+import redis
+import pickle
+from kafka import KafkaConsumer
+import logging
+from recommender import ProductRecommender
 
-# --- Setup Logging ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - CONSUMER - %(levelname)s - %(message)s')
+# --- LOGGING SETUP ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Configuration ---
-CSV_FILE = 'products.csv'
+# --- CONFIGURATION ---
+KAFKA_TOPIC = 'product-events'
+KAFKA_BROKER = 'broker:29092'
+REDIS_HOST = 'redis'
+REDIS_PORT = 6379
+REDIS_MODEL_KEY = 'recommender_model'
+DATA_DIR = "/app/data"
+CSV_PATH = os.path.join(DATA_DIR, "products.csv")
+
+os.makedirs(DATA_DIR, exist_ok=True)
 
 
-# --- Service Connections ---
-def connect_to_service(service_name, connection_func, retries=5, delay=5):
-    """Generic connection function with retries."""
-    for i in range(retries):
+# --- CONNECTIONS ---
+def connect_kafka_consumer():
+    """Connects to Kafka with retry logic."""
+    consumer = None
+    backoff_time = 1
+    while consumer is None:
         try:
-            client = connection_func()
-            logging.info(f"Successfully connected to {service_name}.")
-            return client
+            consumer = KafkaConsumer(
+                KAFKA_TOPIC, bootstrap_servers=KAFKA_BROKER, auto_offset_reset='earliest',
+                group_id='product-recommender-group', value_deserializer=lambda x: json.loads(x.decode('utf-8')))
+            logging.info("Successfully connected to Kafka.")
         except Exception as e:
-            logging.warning(
-                f"{service_name} connection attempt {i + 1}/{retries} failed: {e}. Retrying in {delay} seconds...")
-            time.sleep(delay)
-    logging.error(f"Could not connect to {service_name} after several retries. Exiting.")
-    exit(1)
+            logging.error(f"Kafka connection failed: {e}. Retrying in {backoff_time}s...")
+            time.sleep(backoff_time)
+            backoff_time *= 2
+    return consumer
 
 
-# Inside Docker, we use the service names from docker-compose.yml, not 'localhost'
-chroma_client = connect_to_service("ChromaDB", lambda: chromadb.HttpClient(host='chroma', port=8000))
-collection = chroma_client.get_or_create_collection(name="products")
-
-model = SentenceTransformer('all-MiniLM-L6-v2')
-logging.info("Sentence Transformer model loaded.")
+def connect_redis_client():
+    """Connects to Redis with retry logic."""
+    r = None
+    backoff_time = 1
+    while r is None:
+        try:
+            r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
+            r.ping()
+            logging.info("Successfully connected to Redis.")
+        except Exception as e:
+            logging.error(f"Redis connection failed: {e}. Retrying in {backoff_time}s...")
+            time.sleep(backoff_time)
+            backoff_time *= 2
+    return r
 
 
 class ProductProcessor:
-    def __init__(self, csv_file):
-        self.csv_file = csv_file
-        self.df = self._load_or_create_df()
+    def __init__(self, redis_client):
+        self.redis_client = redis_client
 
-    def _load_or_create_df(self):
-        if os.path.exists(self.csv_file):
-            logging.info(f"Loading existing products from {self.csv_file}")
-            return pd.read_csv(self.csv_file)
-        else:
-            logging.info(f"Creating new products file: {self.csv_file}")
-            df = pd.DataFrame(columns=['id', 'name', 'description'])
-            df.to_csv(self.csv_file, index=False)
-            return df
+    # --- MODIFICATION: Renamed to process_event and now accepts the event dictionary directly ---
+    def process_event(self, event):
+        """Processes an event dictionary to update data and retrain the model."""
+        action = event.get('action')
+        products = event.get('products')
+        logging.info(f"Processing event: {action} for {len(products)} products.")
 
-    def _generate_id(self):
-        if self.df.empty:
-            return "prod_0001"
-        last_id = self.df['id'].max()
-        last_num = int(last_id.split('_')[1])
-        new_num = last_num + 1
-        return f"prod_{new_num:04d}"
+        df = self._update_csv(products, action)
 
-    def add_products(self, products):
-        new_records = []
-        for product in products:
-            new_id = self._generate_id()
-            record = {'id': new_id, 'name': product['name'], 'description': product['description']}
-            new_records.append(record)
-            new_df_record = pd.DataFrame([record])
-            self.df = pd.concat([self.df, new_df_record], ignore_index=True)
+        if not df.empty:
+            recommender = ProductRecommender(k=10)
+            recommender.fit(df)
 
-        self.df.to_csv(self.csv_file, index=False)
-        logging.info(f"Added {len(new_records)} products to CSV.")
-        self._update_chroma(new_records)
+            serialized_model = pickle.dumps(recommender)
+            self.redis_client.set(REDIS_MODEL_KEY, serialized_model)
+            logging.info(f"New recommender model saved to Redis key '{REDIS_MODEL_KEY}'.")
 
-    def update_products(self, products_to_update):
-        updated_records = []
-        for product_update in products_to_update:
-            product_id = product_update['id']
-            idx = self.df.index[self.df['id'] == product_id][0]
-            if 'name' in product_update:
-                self.df.at[idx, 'name'] = product_update['name']
-            if 'description' in product_update:
-                self.df.at[idx, 'description'] = product_update['description']
-            updated_records.append(self.df.loc[idx].to_dict())
+        self._invalidate_redis_cache()
 
-        self.df.to_csv(self.csv_file, index=False)
-        logging.info(f"Updated {len(updated_records)} products in CSV.")
-        self._update_chroma(updated_records)
-
-    def _update_chroma(self, records):
-        if not records:
-            return
-
-        documents_to_embed = [f"{p['name']}: {p['description']}" for p in records]
-        embeddings = model.encode(documents_to_embed).tolist()
-        product_ids = [p['id'] for p in records]
-        product_metadata = [{"name": p['name']} for p in records]
-
-        collection.upsert(
-            ids=product_ids,
-            embeddings=embeddings,
-            metadatas=product_metadata,
-            documents=documents_to_embed
-        )
-        logging.info(f"Upserted {len(records)} records into ChromaDB.")
-
-
-def run_consumer():
-    consumer = connect_to_service("Kafka", lambda: KafkaConsumer(
-        'product-updates',
-        bootstrap_servers='broker:9092',
-        auto_offset_reset='earliest',
-        group_id='product-processor-group',
-        value_deserializer=lambda m: json.loads(m.decode('utf-8'))
-    ))
-    processor = ProductProcessor(CSV_FILE)
-
-    logging.info("Consumer is waiting for messages...")
-    for message in consumer:
+    def _update_csv(self, products, action):
+        """Loads, updates, and saves the products.csv file."""
         try:
-            data = message.value
-            action = data.get('action')
-            payload = data.get('payload')
-            logging.info(f"Received action: {action}")
+            df = pd.read_csv(CSV_PATH) if os.path.exists(CSV_PATH) else pd.DataFrame(
+                columns=['id', 'name', 'description', 'price'])
+        except pd.errors.EmptyDataError:
+            df = pd.DataFrame(columns=['id', 'name', 'description', 'price'])
 
-            if action == 'product-creation':
-                processor.add_products(payload)
-            elif action == 'product-edition':
-                processor.update_products(payload)
-        except Exception as e:
-            logging.error(f"Failed to process message: {message.value}. Error: {e}")
+        if action == 'product-creation':
+            new_products_df = pd.DataFrame(products)
+            df = pd.concat([df, new_products_df], ignore_index=True).drop_duplicates(subset=['id'], keep='last')
+        elif action == 'product-edition':
+            for prod in products:
+                if prod['id'] in df['id'].values:
+                    for key, value in prod.items():
+                        df.loc[df['id'] == prod['id'], key] = value
+                else:
+                    new_prod_df = pd.DataFrame([prod])
+                    df = pd.concat([df, new_prod_df], ignore_index=True)
+
+        df.to_csv(CSV_PATH, index=False)
+        logging.info(f"CSV file updated. Total products: {len(df)}")
+        return df
+
+    def _invalidate_redis_cache(self):
+        """Deletes all search query caches from Redis."""
+        logging.info("Invalidating Redis search cache...")
+        keys = self.redis_client.keys('search:*')
+        if keys:
+            self.redis_client.delete(*keys)
+        logging.info(f"Deleted {len(keys)} cache entries.")
 
 
-if __name__ == '__main__':
-    run_consumer()
+def main():
+    """Initializes connections and starts the consumer loop."""
+    redis_client = connect_redis_client()
+    kafka_consumer = connect_kafka_consumer()
+    processor = ProductProcessor(redis_client)
 
+    # --- MODIFICATION: The logic for initial training is now clearer ---
+    if os.path.exists(CSV_PATH):
+        logging.info("Performing initial training based on existing CSV.")
+        initial_event = {'action': 'initial-training', 'products': []}
+        # Call the refactored method with the event dictionary directly
+        processor.process_event(initial_event)
+
+    logging.info("Consumer is running. Waiting for messages...")
+    for message in kafka_consumer:
+        # --- MODIFICATION: Pass the message's value (the event dictionary) to the processing method ---
+        processor.process_event(message.value)
+
+
+if __name__ == "__main__":
+    main()
