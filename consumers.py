@@ -26,7 +26,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # --- CONNECTIONS ---
 def connect_kafka_consumer():
     """Connects to Kafka with retry logic."""
-    consumer = None
+    consumer = None;
     backoff_time = 1
     while consumer is None:
         try:
@@ -36,14 +36,14 @@ def connect_kafka_consumer():
             logging.info("Successfully connected to Kafka.")
         except Exception as e:
             logging.error(f"Kafka connection failed: {e}. Retrying in {backoff_time}s...")
-            time.sleep(backoff_time)
+            time.sleep(backoff_time);
             backoff_time *= 2
     return consumer
 
 
 def connect_redis_client():
     """Connects to Redis with retry logic."""
-    r = None
+    r = None;
     backoff_time = 1
     while r is None:
         try:
@@ -52,7 +52,7 @@ def connect_redis_client():
             logging.info("Successfully connected to Redis.")
         except Exception as e:
             logging.error(f"Redis connection failed: {e}. Retrying in {backoff_time}s...")
-            time.sleep(backoff_time)
+            time.sleep(backoff_time);
             backoff_time *= 2
     return r
 
@@ -118,13 +118,6 @@ def main():
     redis_client = connect_redis_client()
     kafka_consumer = connect_kafka_consumer()
     processor = ProductProcessor(redis_client)
-
-    # --- MODIFICATION: The logic for initial training is now clearer ---
-    if os.path.exists(CSV_PATH):
-        logging.info("Performing initial training based on existing CSV.")
-        initial_event = {'action': 'initial-training', 'products': []}
-        # Call the refactored method with the event dictionary directly
-        processor.process_event(initial_event)
 
     logging.info("Consumer is running. Waiting for messages...")
     for message in kafka_consumer:

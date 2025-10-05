@@ -3,6 +3,9 @@ import pickle
 import pandas as pd
 import os
 import redis
+import threading
+import io
+import math
 from flask import Blueprint, request, jsonify, render_template, current_app
 from kafka import KafkaProducer
 from recommender import ProductRecommender
@@ -27,8 +30,43 @@ api_bp = Blueprint('api', __name__)
 recommender_cache = {'model': None}
 
 
+# --- MODIFICATION: Updated to accept the Flask app object ---
+def process_csv_in_background(app, csv_stream, batch_size=100):
+    """Reads a CSV stream, batches products, and sends them to Kafka."""
+    # --- MODIFICATION: Wrap logic in app.app_context() ---
+    with app.app_context():
+        try:
+            df = pd.read_csv(csv_stream)
+            if not {'id', 'name', 'description', 'price'}.issubset(df.columns):
+                current_app.logger.error("CSV is missing required columns (id, name, description, price).")
+                return
+
+            df['name'] = df['name'].fillna('')
+            df['description'] = df['description'].fillna('')
+            df['price'] = df['price'].fillna(0)
+
+            total_rows = len(df)
+            num_batches = math.ceil(total_rows / batch_size)
+            current_app.logger.info(f"Starting background import of {total_rows} products in {num_batches} batches.")
+
+            for i in range(0, total_rows, batch_size):
+                batch_df = df.iloc[i:i + batch_size]
+                products = batch_df.to_dict(orient='records')
+
+                message = {'action': 'product-creation', 'products': products}
+                kafka_producer.send(KAFKA_TOPIC, message)
+                current_app.logger.info(f"Sent batch {i // batch_size + 1}/{num_batches} to Kafka.")
+
+            kafka_producer.flush()
+            current_app.logger.info("All batches have been sent to Kafka.")
+
+        except Exception as e:
+            current_app.logger.error(f"Error processing CSV in background: {e}")
+
+
+# --- API Endpoints ---
 def get_recommender():
-    """Loads the recommender model from Redis if not in memory."""
+    # ... (function is unchanged)
     if recommender_cache['model'] is None:
         try:
             serialized_model = redis_client.get(REDIS_MODEL_KEY)
@@ -51,6 +89,7 @@ def index():
 
 @api_bp.route('/products/search')
 def search_products():
+    # ... (function is unchanged)
     query = request.args.get('q', '')
     if not query:
         return jsonify({"error": "Query parameter 'q' is required."}), 400
@@ -64,19 +103,14 @@ def search_products():
     current_app.logger.info(f"CACHE MISS for query: '{query}'")
     recommender = get_recommender()
     if not recommender:
-        return jsonify({"error": "Recommender model is not available yet."}), 503
+        return jsonify({"error": "Recommender model is not available yet. Try importing data."}), 503
 
     recommended_ids = recommender.recommend(name=query, description="", price=0)
 
     try:
         df = pd.read_csv(CSV_PATH)
-
-        # Filter the DataFrame to only get the rows for the recommended products
         results_df = df[df['id'].isin(recommended_ids)]
 
-        # --- MODIFICATION: Reorder the results to match the similarity ranking ---
-        # We convert the 'id' column to a categorical type that has a custom order
-        # based on the `recommended_ids` list, then sort by it.
         results_df['id'] = pd.Categorical(results_df['id'], categories=recommended_ids, ordered=True)
         results_df = results_df.sort_values('id')
 
@@ -85,24 +119,29 @@ def search_products():
     except FileNotFoundError:
         return jsonify({"error": "Product data not found."}), 500
 
-    redis_client.setex(cache_key, 3600, json.dumps(results))  # Cache for 1 hour
+    redis_client.setex(cache_key, 3600, json.dumps(results))
     return jsonify(results)
 
 
-@api_bp.route('/products', methods=['POST'])
-def create_products():
-    products = request.get_json()
-    message = {'action': 'product-creation', 'products': products}
-    kafka_producer.send(KAFKA_TOPIC, message)
-    kafka_producer.flush()
-    return jsonify({"status": "success", "message": "Event sent."}), 202
+@api_bp.route('/products/import', methods=['POST'])
+def import_products():
+    """Handles CSV file upload and starts background processing."""
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part in the request"}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No file selected"}), 400
+    if file and file.filename.endswith('.csv'):
+        stream = io.StringIO(file.stream.read().decode("UTF8"), newline=None)
 
+        # --- MODIFICATION: Get the current app and pass it to the thread ---
+        app = current_app._get_current_object()
+        thread = threading.Thread(target=process_csv_in_background, args=(app, stream))
+        thread.daemon = True
+        thread.start()
 
-@api_bp.route('/products', methods=['PUT'])
-def update_products():
-    products = request.get_json()
-    message = {'action': 'product-edition', 'products': products}
-    kafka_producer.send(KAFKA_TOPIC, message)
-    kafka_producer.flush()
-    recommender_cache['model'] = None
-    return jsonify({"status": "success", "message": "Event sent."}), 202
+        return jsonify(
+            {"status": "success", "message": "Product import started. The model will be updated shortly."}), 202
+
+    return jsonify({"error": "Invalid file type. Please upload a CSV file."}), 400
+

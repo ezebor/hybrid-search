@@ -24,7 +24,6 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
-    # --- MODIFICATION: Added healthcheck to ensure Kafka is ready ---
     healthcheck:
       test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
       interval: 10s
@@ -46,12 +45,11 @@ services:
     volumes:
       - product_data:/app/data
     depends_on:
-      # --- MODIFICATION: Changed depends_on to use the service_healthy condition ---
       broker:
         condition: service_healthy
       redis:
         condition: service_started
-    command: ["python", "app.py"] # Using app.py as entrypoint
+    command: ["python", "app.py"]
 
   kafka_consumer:
     build: .
@@ -59,7 +57,6 @@ services:
     volumes:
       - product_data:/app/data
     depends_on:
-      # --- MODIFICATION: Changed depends_on to use the service_healthy condition ---
       broker:
         condition: service_healthy
       redis:
