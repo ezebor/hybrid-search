@@ -10,7 +10,7 @@ from flask import Blueprint, request, jsonify, render_template, current_app
 from kafka import KafkaProducer
 from recommender import ProductRecommender
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION & CONNECTIONS (Unchanged) ---
 KAFKA_TOPIC = 'product-events'
 KAFKA_BROKER = 'broker:29092'
 REDIS_HOST = 'redis'
@@ -19,7 +19,6 @@ REDIS_MODEL_KEY = 'recommender_model'
 DATA_DIR = "/app/data"
 CSV_PATH = os.path.join(DATA_DIR, "products.csv")
 
-# --- CONNECTIONS ---
 redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
 kafka_producer = KafkaProducer(
     bootstrap_servers=KAFKA_BROKER,
@@ -30,10 +29,9 @@ api_bp = Blueprint('api', __name__)
 recommender_cache = {'model': None}
 
 
-# --- MODIFICATION: Updated to accept the Flask app object ---
+# --- Background CSV Processing ---
 def process_csv_in_background(app, csv_stream, batch_size=100):
-    """Reads a CSV stream, batches products, and sends them to Kafka."""
-    # --- MODIFICATION: Wrap logic in app.app_context() ---
+    """Reads a CSV stream, handles the 'active' column, and sends batches to Kafka."""
     with app.app_context():
         try:
             df = pd.read_csv(csv_stream)
@@ -41,9 +39,16 @@ def process_csv_in_background(app, csv_stream, batch_size=100):
                 current_app.logger.error("CSV is missing required columns (id, name, description, price).")
                 return
 
+            # --- MODIFICATION: Handle the 'active' column ---
+            if 'active' not in df.columns:
+                current_app.logger.info(
+                    "'active' column not found in uploaded CSV. Defaulting all new products to active=1.")
+                df['active'] = 1
+
             df['name'] = df['name'].fillna('')
             df['description'] = df['description'].fillna('')
             df['price'] = df['price'].fillna(0)
+            df['active'] = df['active'].fillna(1)  # Default any missing active values to 1
 
             total_rows = len(df)
             num_batches = math.ceil(total_rows / batch_size)
@@ -64,9 +69,8 @@ def process_csv_in_background(app, csv_stream, batch_size=100):
             current_app.logger.error(f"Error processing CSV in background: {e}")
 
 
-# --- API Endpoints ---
+# --- API Endpoints (Unchanged, as filtering logic is now handled by the recommender) ---
 def get_recommender():
-    # ... (function is unchanged)
     if recommender_cache['model'] is None:
         try:
             serialized_model = redis_client.get(REDIS_MODEL_KEY)
@@ -89,7 +93,6 @@ def index():
 
 @api_bp.route('/products/search')
 def search_products():
-    # ... (function is unchanged)
     query = request.args.get('q', '')
     if not query:
         return jsonify({"error": "Query parameter 'q' is required."}), 400
@@ -125,7 +128,6 @@ def search_products():
 
 @api_bp.route('/products/import', methods=['POST'])
 def import_products():
-    """Handles CSV file upload and starts background processing."""
     if 'file' not in request.files:
         return jsonify({"error": "No file part in the request"}), 400
     file = request.files['file']
@@ -134,7 +136,6 @@ def import_products():
     if file and file.filename.endswith('.csv'):
         stream = io.StringIO(file.stream.read().decode("UTF8"), newline=None)
 
-        # --- MODIFICATION: Get the current app and pass it to the thread ---
         app = current_app._get_current_object()
         thread = threading.Thread(target=process_csv_in_background, args=(app, stream))
         thread.daemon = True

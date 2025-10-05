@@ -5,10 +5,10 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.neighbors import NearestNeighbors
 
+
 class ProductRecommender:
     """
-    A KNN-based recommender system using TF-IDF for text and StandardScaler for price.
-    This class is designed to be trained, serialized, and then used for predictions.
+    A KNN-based recommender system that only trains on and recommends active products.
     """
 
     def __init__(self, k=5):
@@ -17,7 +17,6 @@ class ProductRecommender:
         self.model = None
         self.product_ids = None
 
-        # Define the preprocessing pipeline for consistent transformation
         preprocessor = ColumnTransformer(
             transformers=[
                 ('text', TfidfVectorizer(stop_words='english', max_features=5000), 'full_text'),
@@ -29,24 +28,39 @@ class ProductRecommender:
 
     def fit(self, df: pd.DataFrame):
         """
-        Fits the preprocessing pipeline and the NearestNeighbors model on the data.
+        Filters for active products and then fits the model.
         """
-        df['full_text'] = df['name'].fillna('') + ' ' + df['description'].fillna('')
+        # --- MODIFICATION: Ensure 'active' column exists and filter the DataFrame ---
+        if 'active' not in df.columns:
+            # If the active column is missing, assume all products are active
+            df['active'] = 1
 
-        X_transformed = self.pipeline.fit_transform(df)
+        # Convert to boolean and filter for only active products
+        df['active'] = df['active'].astype(bool)
+        active_df = df[df['active'] == True].copy()
+
+        if active_df.empty:
+            print("No active products found to train the model.")
+            self.model = None  # Ensure the model is cleared if no active products exist
+            return
+
+        active_df['full_text'] = active_df['name'].fillna('') + ' ' + active_df['description'].fillna('')
+
+        X_transformed = self.pipeline.fit_transform(active_df)
 
         self.model = NearestNeighbors(n_neighbors=self.k, metric='cosine')
         self.model.fit(X_transformed)
 
-        self.product_ids = df['id'].values
-        print("Recommender model has been successfully trained.")
+        self.product_ids = active_df['id'].values
+        print(f"Recommender model has been successfully trained on {len(active_df)} active products.")
 
     def recommend(self, name: str, description: str, price: float) -> list[int]:
         """
-        Transforms a query and finds the K most similar products.
+        Transforms a query and finds the K most similar products from the active set.
         """
         if self.pipeline is None or self.model is None:
-            raise RuntimeError("The recommender has not been fitted yet. Call .fit() first.")
+            # This will be the case if no active products were available during training
+            return []
 
         query_df = pd.DataFrame([{'name': name, 'description': description, 'price': price}])
         query_df['full_text'] = query_df['name'] + ' ' + query_df['description']
@@ -59,3 +73,4 @@ class ProductRecommender:
         recommended_ids = self.product_ids[neighbor_indices]
 
         return recommended_ids.tolist()
+
